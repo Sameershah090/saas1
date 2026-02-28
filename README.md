@@ -77,9 +77,15 @@ A **bidirectional bridge** that mirrors your WhatsApp messages, media, and calls
 - `/status` — Component status JSON
 
 ### 🐳 Docker Support
-- `Dockerfile` with Chromium for Puppeteer
+- `Dockerfile` optimized for low-memory Node deployments (no Chromium runtime dependency)
 - `docker-compose.yml` with persistent volumes
 - Built-in health check
+
+
+### 🧠 Low-RAM Mode (1GB VPS friendly)
+- WhatsApp transport now uses **Baileys** (WebSocket protocol) instead of a full Chromium session
+- Greatly lower idle RAM usage on small VPS instances
+- Existing bridge features are preserved where supported by the WhatsApp protocol layer
 
 ### ⚙️ Infrastructure
 - **Database migrations** — automatic schema versioning

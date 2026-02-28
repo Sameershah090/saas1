@@ -3,7 +3,6 @@ const telegramService = require('../services/telegram');
 const messageMapper = require('../services/messageMapper');
 const mediaHandler = require('../services/mediaHandler');
 const { Contact, MessageMap } = require('../database');
-const { MessageMedia } = require('whatsapp-web.js');
 const logger = require('../utils/logger');
 const rateLimiter = require('../utils/rateLimiter');
 const path = require('path');
@@ -114,13 +113,12 @@ class TelegramReplyHandler {
     const filePath = await bot.downloadFile(fileId, path.join(config.paths.media, 'outgoing'));
 
     try {
-      const media = MessageMedia.fromFilePath(filePath);
       const options = {};
       if (caption) options.caption = caption;
       if (quotedWaMessageId) options.quotedMessageId = quotedWaMessageId;
       if (msg.sticker) options.sendMediaAsSticker = true;
 
-      const sentMsg = await whatsappService.getClient().sendMessage(targetWaId, media, options);
+      const sentMsg = await whatsappService.sendMediaFromFile(targetWaId, filePath, options);
       mediaHandler.cleanupFile(filePath);
       return sentMsg;
     } catch (error) {

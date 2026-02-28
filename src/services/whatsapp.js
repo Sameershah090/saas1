@@ -1,10 +1,18 @@
-const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+  downloadMediaMessage,
+  getContentType,
+  jidNormalizedUser,
+} = require('@whiskeysockets/baileys');
 const qrcode = require('qrcode');
+const path = require('path');
+const fs = require('fs');
+const mime = require('mime-types');
 const { config } = require('../config');
 const logger = require('../utils/logger');
 const telegramService = require('./telegram');
-const fs = require('fs');
-const path = require('path');
 
 class WhatsAppService {
   constructor() {
@@ -16,12 +24,11 @@ class WhatsAppService {
     this.eventHandlers = {};
     this.pendingQR = null;
     this.qrRequested = false;
-
-    // Auto-reconnect state
     this.reconnectAttempts = 0;
     this.maxReconnectAttempts = 10;
     this.reconnectTimer = null;
     this.autoReconnect = true;
+    this.messageCache = new Map();
   }
 
   hasSession() {
@@ -29,155 +36,113 @@ class WhatsAppService {
       const sessionDir = path.resolve(config.paths.waSession);
       if (!fs.existsSync(sessionDir)) return false;
       const contents = fs.readdirSync(sessionDir);
-      return contents.some((item) => item.startsWith('session'));
+      return contents.some((item) => item.startsWith('creds') || item.endsWith('.json'));
     } catch {
       return false;
     }
   }
 
   async initialize() {
-    if (this.client) {
-      try { await this.client.destroy(); } catch (e) { }
-      this.client = null;
-    }
+    this.autoReconnect = true;
+    const sessionDir = path.resolve(config.paths.waSession);
+    fs.mkdirSync(sessionDir, { recursive: true });
 
-    this.client = new Client({
-      authStrategy: new LocalAuth({ dataPath: config.paths.waSession }),
-      puppeteer: {
-        headless: true,
-        args: [
-          '--no-sandbox',
-          '--disable-setuid-sandbox',
-          '--disable-dev-shm-usage',
-          '--disable-accelerated-2d-canvas',
-          '--no-first-run',
-          '--no-zygote',
-          '--disable-gpu',
-        ],
-      },
+    const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+
+    this.client = makeWASocket({
+      auth: state,
+      printQRInTerminal: false,
+      markOnlineOnConnect: false,
+      syncFullHistory: false,
+      browser: ['Bridge', 'Chrome', '1.0.0'],
     });
 
+    this.client.ev.on('creds.update', saveCreds);
     this.setupClientEvents();
-    await this.client.initialize();
     return this.client;
   }
 
   setupClientEvents() {
-    this.client.on('qr', async (qr) => {
-      this.qrRetries++;
-      logger.info('QR Code received (attempt ' + this.qrRetries + '/' + this.maxQrRetries + ')');
-      if (this.qrRetries > this.maxQrRetries) {
-        logger.error('Max QR retries reached. Waiting for /login command.');
+    this.client.ev.on('connection.update', async (update) => {
+      const { connection, lastDisconnect, qr } = update;
+
+      if (qr) {
+        this.qrRetries++;
+        this.pendingQR = qr;
+        logger.info('QR Code received (attempt ' + this.qrRetries + '/' + this.maxQrRetries + ')');
+        if (this.qrRetries > this.maxQrRetries) {
+          logger.error('Max QR retries reached. Waiting for /login command.');
+          this.pendingQR = null;
+          this.qrRequested = false;
+          await telegramService.sendToAdmin('❌ <b>Max QR attempts reached.</b>\nUse /login to try again.');
+          return;
+        }
+        if (this.qrRequested) await this._sendQRToTelegram(qr);
+      }
+
+      if (connection === 'open') {
+        this.isReady = true;
+        this.isAuthenticated = true;
+        this.reconnectAttempts = 0;
         this.pendingQR = null;
         this.qrRequested = false;
-        try {
-          await telegramService.sendToAdmin('❌ <b>Max QR attempts reached.</b>\nUse /login to try again.');
-        } catch (e) { }
-        return;
+        logger.info('WhatsApp client is ready (Baileys)');
+        await telegramService.sendToAdmin('🟢 <b>WhatsApp is connected and ready!</b>');
+        this.emit('ready');
       }
-      this.pendingQR = qr;
-      if (this.qrRequested) {
-        await this._sendQRToTelegram(qr);
-      } else {
-        logger.info('QR buffered. Waiting for /login command.');
-      }
-    });
 
-    this.client.on('authenticated', () => {
-      this.isAuthenticated = true;
-      this.qrRetries = 0;
-      this.pendingQR = null;
-      this.qrRequested = false;
-      this.reconnectAttempts = 0; // Reset reconnect counter on successful auth
-      logger.info('WhatsApp authenticated');
-      telegramService.sendToAdmin('✅ <b>WhatsApp authenticated successfully!</b>');
-    });
+      if (connection === 'close') {
+        this.isReady = false;
+        this.isAuthenticated = false;
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        const isLoggedOut = statusCode === DisconnectReason.loggedOut;
 
-    this.client.on('auth_failure', (msg) => {
-      this.isAuthenticated = false;
-      this.pendingQR = null;
-      logger.error('WhatsApp auth failure:', msg);
-      telegramService.sendToAdmin('❌ <b>WhatsApp authentication failed!</b>\n<code>' + msg + '</code>\nUse /login to try again.');
-    });
-
-    this.client.on('ready', () => {
-      this.isReady = true;
-      this.reconnectAttempts = 0;
-      logger.info('WhatsApp client is ready');
-      telegramService.sendToAdmin('🟢 <b>WhatsApp is connected and ready!</b>');
-      this.emit('ready');
-    });
-
-    this.client.on('disconnected', async (reason) => {
-      this.isReady = false;
-      this.isAuthenticated = false;
-      logger.warn('WhatsApp disconnected:', reason);
-
-      if (reason === 'LOGOUT') {
-        // User-initiated logout, don't auto-reconnect
-        this.autoReconnect = false;
-        telegramService.sendToAdmin('🔴 <b>WhatsApp logged out.</b>\nUse /login to reconnect.');
-      } else if (this.autoReconnect) {
-        telegramService.sendToAdmin(
-          '🔴 <b>WhatsApp disconnected!</b>\nReason: <code>' + reason + '</code>\n⏳ Auto-reconnecting...'
-        );
-        this._scheduleReconnect();
-      } else {
-        telegramService.sendToAdmin('🔴 <b>WhatsApp disconnected!</b>\nReason: <code>' + reason + '</code>\nUse /login to reconnect.');
+        logger.warn('WhatsApp disconnected:', statusCode || 'unknown');
+        if (isLoggedOut) {
+          this.autoReconnect = false;
+          await telegramService.sendToAdmin('🔴 <b>WhatsApp logged out.</b>\nUse /login to reconnect.');
+        } else if (this.autoReconnect) {
+          await telegramService.sendToAdmin('🔴 <b>WhatsApp disconnected!</b>\n⏳ Auto-reconnecting...');
+          this._scheduleReconnect();
+        }
       }
     });
 
-    // Core message events
-    this.client.on('message', (msg) => this.emit('message', msg));
-    this.client.on('message_create', (msg) => this.emit('message_create', msg));
-    this.client.on('message_ack', (msg, ack) => this.emit('message_ack', msg, ack));
-    this.client.on('call', (call) => this.emit('call', call));
+    this.client.ev.on('messages.upsert', async ({ messages }) => {
+      for (const rawMsg of messages || []) {
+        const normalized = this._normalizeMessage(rawMsg);
+        if (!normalized) continue;
 
-    // Reaction events
-    this.client.on('message_reaction', (reaction) => this.emit('message_reaction', reaction));
+        this.messageCache.set(normalized.id._serialized, normalized);
+        if (this.messageCache.size > 500) {
+          const firstKey = this.messageCache.keys().next().value;
+          this.messageCache.delete(firstKey);
+        }
 
-    // Message edit/revoke events
-    this.client.on('message_revoke_everyone', (after, before) => this.emit('message_revoke_everyone', after, before));
-    this.client.on('message_edit', (msg, newBody, oldBody) => this.emit('message_edit', msg, newBody, oldBody));
-
-    // Group events
-    this.client.on('group_join', (notification) => this.emit('group_join', notification));
-    this.client.on('group_leave', (notification) => this.emit('group_leave', notification));
-    this.client.on('group_update', (notification) => this.emit('group_update', notification));
-    this.client.on('group_admin_changed', (notification) => this.emit('group_admin_changed', notification));
+        if (normalized.fromMe) this.emit('message_create', normalized);
+        else this.emit('message', normalized);
+      }
+    });
   }
 
-  /**
-   * Auto-reconnect with exponential backoff.
-   */
   _scheduleReconnect() {
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
 
     this.reconnectAttempts++;
     if (this.reconnectAttempts > this.maxReconnectAttempts) {
       logger.error('Max reconnect attempts reached (' + this.maxReconnectAttempts + ')');
-      telegramService.sendToAdmin(
-        '❌ <b>Auto-reconnect failed after ' + this.maxReconnectAttempts + ' attempts.</b>\nUse /login to connect manually.'
-      );
+      telegramService.sendToAdmin('❌ <b>Auto-reconnect failed.</b>\nUse /login to connect manually.');
       this.reconnectAttempts = 0;
       return;
     }
 
-    // Exponential backoff: 5s, 10s, 20s, 40s, 80s, ... capped at 5 min
     const delay = Math.min(5000 * Math.pow(2, this.reconnectAttempts - 1), 300000);
-    const delaySec = Math.round(delay / 1000);
-
-    logger.info('Reconnecting in ' + delaySec + 's (attempt ' + this.reconnectAttempts + '/' + this.maxReconnectAttempts + ')');
-
     this.reconnectTimer = setTimeout(async () => {
       try {
-        logger.info('Auto-reconnect attempt ' + this.reconnectAttempts + '...');
         await this.initialize();
       } catch (error) {
         logger.error('Reconnect attempt failed:', error);
-        if (this.autoReconnect) {
-          this._scheduleReconnect();
-        }
+        if (this.autoReconnect) this._scheduleReconnect();
       }
     }, delay);
   }
@@ -186,11 +151,8 @@ class WhatsAppService {
     this.qrRequested = true;
     this.qrRetries = 0;
     this.autoReconnect = true;
-
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-    }
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
 
     if (this.pendingQR) {
       await this._sendQRToTelegram(this.pendingQR);
@@ -200,14 +162,77 @@ class WhatsAppService {
   }
 
   async _sendQRToTelegram(qr) {
+    const qrBuffer = await qrcode.toBuffer(qr, { type: 'png', width: 512, margin: 2 });
+    await telegramService.sendQRCode(qrBuffer);
+  }
+
+  _normalizeMessage(rawMsg) {
+    if (!rawMsg?.message || !rawMsg.key?.remoteJid) return null;
+
+    const key = rawMsg.key;
+    const messageType = getContentType(rawMsg.message) || 'conversation';
+    const content = rawMsg.message[messageType] || {};
+    const from = jidNormalizedUser(key.remoteJid);
+    const fromMe = !!key.fromMe;
+
+    let body = '';
+    if (messageType === 'conversation') body = rawMsg.message.conversation || '';
+    else if (content?.text) body = content.text;
+    else if (content?.caption) body = content.caption;
+
+    const msgId = key.id;
+    const quoted = content?.contextInfo?.stanzaId;
+    const hasMedia = !!(
+      rawMsg.message.imageMessage || rawMsg.message.videoMessage || rawMsg.message.audioMessage ||
+      rawMsg.message.documentMessage || rawMsg.message.stickerMessage
+    );
+
+    return {
+      _raw: rawMsg,
+      id: { _serialized: msgId },
+      from,
+      to: from,
+      fromMe,
+      author: content?.contextInfo?.participant || rawMsg.participant,
+      body,
+      type: this._mapType(messageType),
+      isStatus: from === 'status@broadcast',
+      hasMedia,
+      hasQuotedMsg: !!quoted,
+      getQuotedMessage: async () => this.messageCache.get(quoted) || null,
+      downloadMedia: async () => this._downloadMedia(rawMsg),
+      location: content?.degreesLatitude ? { latitude: content.degreesLatitude, longitude: content.degreesLongitude } : null,
+    };
+  }
+
+  _mapType(type) {
+    const map = {
+      conversation: 'text',
+      extendedTextMessage: 'text',
+      imageMessage: 'image',
+      videoMessage: 'video',
+      audioMessage: 'audio',
+      documentMessage: 'document',
+      stickerMessage: 'sticker',
+      locationMessage: 'location',
+      contactMessage: 'vcard',
+      contactsArrayMessage: 'multi_vcard',
+    };
+    return map[type] || type;
+  }
+
+  async _downloadMedia(rawMsg) {
     try {
-      const qrBuffer = await qrcode.toBuffer(qr, { type: 'png', width: 512, margin: 2 });
-      await telegramService.sendQRCode(qrBuffer);
+      const buffer = await downloadMediaMessage(rawMsg, 'buffer', {}, { logger: undefined, reuploadRequest: this.client.updateMediaMessage });
+      if (!buffer) return null;
+
+      const messageType = getContentType(rawMsg.message);
+      const mediaMsg = rawMsg.message[messageType] || {};
+      const mimetype = mediaMsg.mimetype || 'application/octet-stream';
+      return { mimetype, data: buffer.toString('base64'), filename: mediaMsg.fileName || `file.${mime.extension(mimetype) || 'bin'}` };
     } catch (error) {
-      logger.error('Error sending QR code:', error);
-      try {
-        await telegramService.sendToAdmin('📱 <b>QR Code ready but failed to send image. Check logs.</b>');
-      } catch (e) { }
+      logger.error('Failed to download media:', error.message);
+      return null;
     }
   }
 
@@ -217,160 +242,96 @@ class WhatsAppService {
   }
 
   emit(event, ...args) {
-    if (this.eventHandlers[event]) {
-      for (const handler of this.eventHandlers[event]) {
-        try { handler(...args); } catch (error) {
-          logger.error('Error in event handler for ' + event + ':', error);
-        }
-      }
+    if (!this.eventHandlers[event]) return;
+    for (const handler of this.eventHandlers[event]) {
+      try { handler(...args); } catch (error) { logger.error('Error in event handler for ' + event + ':', error); }
     }
   }
 
   async sendMessage(chatId, content, options = {}) {
     if (!this.isReady) throw new Error('WhatsApp client is not ready');
-    return this.client.sendMessage(chatId, content, options);
+
+    const payload = typeof content === 'string' ? { text: content } : content;
+    const sent = await this.client.sendMessage(chatId, payload, {
+      quoted: options.quotedMessage,
+      quotedMessageId: options.quotedMessageId,
+    });
+
+    return {
+      id: { _serialized: sent.key.id },
+      fromMe: true,
+      from: sent.key.remoteJid,
+      to: sent.key.remoteJid,
+      body: payload.text || options.caption || '',
+      type: payload.text ? 'text' : 'media',
+      hasMedia: !!(payload.image || payload.video || payload.document || payload.audio || payload.sticker),
+      _raw: sent,
+    };
+  }
+
+  async sendMediaFromFile(chatId, filePath, options = {}) {
+    const mimetype = mime.lookup(filePath) || 'application/octet-stream';
+    const extType = mimetype.split('/')[0];
+    const quotedOptions = {};
+    if (options.quotedMessageId) quotedOptions.quotedMessageId = options.quotedMessageId;
+
+    if (options.sendMediaAsSticker) {
+      return this.sendMessage(chatId, { sticker: fs.readFileSync(filePath) }, quotedOptions);
+    }
+
+    const mediaPayload = {};
+    if (extType === 'image') mediaPayload.image = fs.readFileSync(filePath);
+    else if (extType === 'video') mediaPayload.video = fs.readFileSync(filePath);
+    else if (extType === 'audio') mediaPayload.audio = fs.readFileSync(filePath);
+    else mediaPayload.document = fs.readFileSync(filePath);
+
+    if (options.caption) mediaPayload.caption = options.caption;
+    if (extType !== 'audio') mediaPayload.mimetype = mimetype;
+
+    return this.sendMessage(chatId, mediaPayload, quotedOptions);
   }
 
   async getContactInfo(waId) {
-    try {
-      const contact = await this.client.getContactById(waId);
-      return {
-        waId: contact.id._serialized,
-        phone: contact.number,
-        pushName: contact.pushname || null,
-        savedName: contact.name || null,
-        isGroup: contact.isGroup || false,
-      };
-    } catch (error) {
-      return {
-        waId,
-        phone: waId.replace(/@[cg]\.us$/, ''),
-        pushName: null,
-        savedName: null,
-        isGroup: waId.includes('@g.us'),
-      };
-    }
+    const phone = waId.replace(/@s\.whatsapp\.net|@[cg]\.us$/, '');
+    return {
+      waId,
+      phone,
+      pushName: null,
+      savedName: null,
+      isGroup: waId.includes('@g.us'),
+    };
   }
 
-  /**
-   * Get profile picture URL for a contact.
-   */
-  async getProfilePicUrl(waId) {
-    try {
-      if (!this.client || !this.isReady) return null;
-      return await this.client.getProfilePicUrl(waId);
-    } catch {
-      return null;
-    }
-  }
-
-  /**
-   * Send typing indicator to a WhatsApp chat.
-   */
-  async sendTyping(chatId) {
-    try {
-      if (!this.isReady) return;
-      const chat = await this.client.getChatById(chatId);
-      await chat.sendStateTyping();
-    } catch (error) {
-      logger.error('Error sending typing indicator:', error);
-    }
-  }
-
-  /**
-   * Clear typing indicator.
-   */
-  async clearTyping(chatId) {
-    try {
-      if (!this.isReady) return;
-      const chat = await this.client.getChatById(chatId);
-      await chat.clearState();
-    } catch (error) {
-      // Silently fail
-    }
-  }
-
-  /**
-   * Get WhatsApp statuses/stories.
-   */
-  async getStatuses() {
-    try {
-      if (!this.isReady) return [];
-      const chats = await this.client.getChats();
-      const statusChat = chats.find((c) => c.id._serialized === 'status@broadcast');
-      if (!statusChat) return [];
-      const messages = await statusChat.fetchMessages({ limit: 20 });
-      return messages;
-    } catch (error) {
-      logger.error('Error fetching statuses:', error);
-      return [];
-    }
-  }
-
-  /**
-   * React to a WhatsApp message.
-   */
-  async reactToMessage(messageId, emoji) {
-    try {
-      if (!this.isReady) return;
-      const msg = await this.client.getMessageById(messageId);
-      if (msg) await msg.react(emoji);
-    } catch (error) {
-      logger.error('Error reacting to message:', error);
-    }
-  }
+  async getProfilePicUrl() { return null; }
+  async sendTyping() { }
+  async clearTyping() { }
+  async getStatuses() { return []; }
+  async reactToMessage() { }
 
   async restart() {
-    logger.info('Restarting WhatsApp client...');
     this.isReady = false;
     this.isAuthenticated = false;
-    this.qrRetries = 0;
-    this.pendingQR = null;
-    this.qrRequested = false;
-    this.autoReconnect = true;
-    if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
-    try { if (this.client) await this.client.destroy(); } catch (e) { }
-    this.client = null;
-    await new Promise((resolve) => setTimeout(resolve, 3000));
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+    await new Promise((resolve) => setTimeout(resolve, 1000));
     this.qrRequested = true;
     await this.initialize();
   }
 
   async logout() {
-    try {
-      this.autoReconnect = false;
-      if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
-
-      if (this.client) {
-        try { await this.client.logout(); } catch (e) {
-          logger.warn('client.logout() failed:', e.message);
-        }
-        try { await this.client.destroy(); } catch (e) {
-          logger.warn('client.destroy() failed:', e.message);
-        }
-      }
-
-      this._clearSession();
-      this.client = null;
-      this.isReady = false;
-      this.isAuthenticated = false;
-      this.qrRetries = 0;
-      this.pendingQR = null;
-      this.qrRequested = false;
-      this.reconnectAttempts = 0;
-
-      logger.info('WhatsApp logged out and session cleared');
-      await telegramService.sendToAdmin(
-        '👋 <b>WhatsApp logged out successfully.</b>\n🗑 Session data cleared.\n🔑 Use /login to connect with a fresh QR code.'
-      );
-    } catch (error) {
-      logger.error('Error during logout:', error);
-      this._clearSession();
-      this.client = null;
-      this.isReady = false;
-      this.isAuthenticated = false;
-      throw error;
+    this.autoReconnect = false;
+    if (this.client) {
+      try { await this.client.logout(); } catch (e) {}
+      try { this.client.end(new Error('logout')); } catch (e) {}
     }
+    this._clearSession();
+    this.client = null;
+    this.isReady = false;
+    this.isAuthenticated = false;
+    this.pendingQR = null;
+    this.qrRequested = false;
+    this.reconnectAttempts = 0;
+    await telegramService.sendToAdmin('👋 <b>WhatsApp logged out successfully.</b>\nUse /login to connect again.');
   }
 
   _clearSession() {
@@ -379,7 +340,6 @@ class WhatsAppService {
       if (fs.existsSync(sessionDir)) {
         fs.rmSync(sessionDir, { recursive: true, force: true });
         fs.mkdirSync(sessionDir, { recursive: true });
-        logger.info('Session directory cleared: ' + sessionDir);
       }
     } catch (error) {
       logger.error('Failed to clear session directory:', error);
