@@ -5,8 +5,6 @@ const {
   downloadMediaMessage,
   getContentType,
   jidNormalizedUser,
-  Browsers,
-  fetchLatestBaileysVersion,
 } = require('@whiskeysockets/baileys');
 const qrcode = require('qrcode');
 const path = require('path');
@@ -49,27 +47,14 @@ class WhatsAppService {
     const sessionDir = path.resolve(config.paths.waSession);
     fs.mkdirSync(sessionDir, { recursive: true });
 
-    if (this.client) {
-      try { this.client.end(new Error('reinitialize')); } catch (e) {}
-      this.client = null;
-    }
-
     const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
-    const { version } = await fetchLatestBaileysVersion();
 
     this.client = makeWASocket({
       auth: state,
-      version,
       printQRInTerminal: false,
       markOnlineOnConnect: false,
       syncFullHistory: false,
-      browser: Browsers.ubuntu('Chrome'),
-      connectTimeoutMs: 60000,
-      keepAliveIntervalMs: 25000,
-      retryRequestDelayMs: 3500,
-      fireInitQueries: true,
-      emitOwnEvents: true,
-      generateHighQualityLinkPreview: false,
+      browser: ['Bridge', 'Chrome', '1.0.0'],
     });
 
     this.client.ev.on('creds.update', saveCreds);
@@ -110,15 +95,14 @@ class WhatsAppService {
         this.isReady = false;
         this.isAuthenticated = false;
         const statusCode = lastDisconnect?.error?.output?.statusCode;
-        const reason = lastDisconnect?.error?.message || 'unknown';
         const isLoggedOut = statusCode === DisconnectReason.loggedOut;
 
-        logger.warn('WhatsApp disconnected: ' + (statusCode || 'unknown') + ' (' + reason + ')');
+        logger.warn('WhatsApp disconnected:', statusCode || 'unknown');
         if (isLoggedOut) {
           this.autoReconnect = false;
           await telegramService.sendToAdmin('🔴 <b>WhatsApp logged out.</b>\nUse /login to reconnect.');
         } else if (this.autoReconnect) {
-          await telegramService.sendToAdmin('🔴 <b>WhatsApp disconnected!</b>\nReason: <code>' + (statusCode || 'unknown') + '</code>\n⏳ Auto-reconnecting...');
+          await telegramService.sendToAdmin('🔴 <b>WhatsApp disconnected!</b>\n⏳ Auto-reconnecting...');
           this._scheduleReconnect();
         }
       }
