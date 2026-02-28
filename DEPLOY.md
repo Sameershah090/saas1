@@ -36,27 +36,8 @@ apt install -y nodejs
 node -v   # Should show v20.x
 npm -v    # Should show 10.x
 
-# Install Chromium dependencies (needed for WhatsApp Web via Puppeteer)
-apt install -y \
-  chromium-browser \
-  fonts-liberation \
-  libappindicator3-1 \
-  libasound2 \
-  libatk-bridge2.0-0 \
-  libatk1.0-0 \
-  libcups2 \
-  libdbus-1-3 \
-  libdrm2 \
-  libgbm1 \
-  libgtk-3-0 \
-  libnspr4 \
-  libnss3 \
-  libxcomposite1 \
-  libxdamage1 \
-  libxrandr2 \
-  xdg-utils \
-  ca-certificates \
-  --no-install-recommends
+# Chromium is no longer required (Baileys-based WhatsApp transport).
+# Keep system minimal for 1GB RAM servers.
 
 # Install build tools (for native modules like better-sqlite3)
 apt install -y build-essential python3
@@ -321,7 +302,7 @@ docker compose down
 | Issue | Fix |
 |-------|-----|
 | `better-sqlite3` build fails | `sudo apt install build-essential python3` then `npm rebuild` |
-| Chromium not found | `sudo apt install chromium-browser` or set `PUPPETEER_EXECUTABLE_PATH` |
+| WhatsApp disconnect loops | clear `wa_session/` and re-run `/login` to re-pair the Baileys session |
 | Permission denied | Make sure you're running as `bridge` user, not root |
 | QR code not appearing | Send `/login` in Telegram, check `pm2 logs` |
 | Dashboard not accessible | Check `ufw allow 3001/tcp` or use nginx |
